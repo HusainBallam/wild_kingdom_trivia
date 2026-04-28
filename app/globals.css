@@ -399,6 +399,62 @@ main {
 .quit-btn:hover { background: var(--bark); color: var(--cream); }
 .quit-btn:active { transform: translateY(1px); }
 
+/* ---------- Loading screen ---------- */
+.loading-screen {
+  text-align: center;
+  padding: 28px 16px 20px;
+}
+.loading-screen .hero { font-size: 3rem; margin: 0; }
+.loading-screen h2 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 1.3rem;
+  margin: 6px 0 14px;
+  color: var(--leaf-dark);
+  letter-spacing: 0.5px;
+}
+.loading-screen .lead {
+  font-size: 1.05rem;
+  color: var(--bark);
+  margin: 0 auto;
+  max-width: 380px;
+}
+.spinner {
+  width: 52px;
+  height: 52px;
+  border: 5px solid var(--cream-soft);
+  border-top-color: var(--sun-deep);
+  border-right-color: var(--sun);
+  border-radius: 50%;
+  margin: 22px auto;
+  animation: spinner-spin 0.9s linear infinite;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+@keyframes spinner-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Error banner used on the start screen */
+.error-banner {
+  background: var(--danger-soft);
+  border: 2px dashed var(--danger);
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin: 0 0 14px;
+  font-family: var(--font-body);
+  color: var(--danger);
+  font-size: 1rem;
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+.error-banner::before {
+  content: '⚠️';
+  flex-shrink: 0;
+}
+
 /* ---------- Start screen ---------- */
 .start { text-align: center; padding: 8px 4px 4px; }
 .start .hero { font-size: 4rem; margin: 0 0 6px; }

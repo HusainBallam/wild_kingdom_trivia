@@ -2,12 +2,13 @@
 
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
-  QUESTIONS,
   DIFFICULTIES,
   DIFFICULTY_ORDER,
+  QUESTIONS_PER_GAME,
   type Difficulty,
   type Question,
 } from '../data/questions';
+import { fetchQuestions } from '../lib/api';
 import {
   loadLeaderboard,
   addScore,
@@ -17,7 +18,7 @@ import {
 import JungleBackground from './JungleBackground';
 import Leaderboard from './Leaderboard';
 
-type Screen = 'start' | 'question' | 'results';
+type Screen = 'start' | 'loading' | 'question' | 'results';
 type Phase = 'idle' | 'leaving' | 'entering';
 
 const LETTERS = ['A', 'B', 'C', 'D'] as const;
@@ -27,17 +28,8 @@ const ADVANCE_DELAY_MS = 1700;
 const HIGH_SCORE_THRESHOLD = 0.8;
 const NAME_MAX = 20;
 
-function shuffle<T>(arr: T[]): T[] {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
 function resultCopy(score: number, total: number) {
-  const pct = score / total;
+  const pct = total > 0 ? score / total : 0;
   if (pct === 1)        return { title: 'Safari Legend!',    blurb: 'A perfect score — you know the wild kingdom inside out!',                trophy: '🏆' };
   if (pct >= 0.8)       return { title: 'Sharp Tracker!',    blurb: 'Outstanding work — only the best rangers spot that many.',              trophy: '🥇' };
   if (pct >= 0.6)       return { title: 'Field Naturalist',  blurb: "Solid performance — you've got real animal smarts.",                    trophy: '🥈' };
@@ -50,9 +42,11 @@ export default function TriviaGame() {
   const [screenPhase, setScreenPhase] = useState<Phase>('idle');
   const [questionPhase, setQuestionPhase] = useState<Phase>('idle');
 
-  const [order, setOrder] = useState<number[]>(() => QUESTIONS.map((_, i) => i));
+  const [questions, setQuestions] = useState<Question[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [score, setScore] = useState(0);
+
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const [answered, setAnswered] = useState(false);
   const [selected, setSelected] = useState<number | null>(null);
@@ -74,6 +68,7 @@ export default function TriviaGame() {
   const questionSwapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const enteringResetRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const highScoreTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchAbortRef      = useRef<AbortController | null>(null);
 
   // Audio
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -85,9 +80,8 @@ export default function TriviaGame() {
 
   const currentQ: Question | null = useMemo(() => {
     if (screen !== 'question') return null;
-    const id = order[currentIndex];
-    return id == null ? null : QUESTIONS[id];
-  }, [screen, order, currentIndex]);
+    return questions[currentIndex] ?? null;
+  }, [screen, questions, currentIndex]);
 
   // ---- Hydrate leaderboard from localStorage ----
   useEffect(() => {
@@ -106,6 +100,10 @@ export default function TriviaGame() {
       if (r.current) clearTimeout(r.current);
       r.current = null;
     });
+    if (fetchAbortRef.current) {
+      try { fetchAbortRef.current.abort(); } catch { /* ignore */ }
+      fetchAbortRef.current = null;
+    }
   }, []);
 
   useEffect(() => () => {
@@ -184,7 +182,6 @@ export default function TriviaGame() {
     const bus = newSfxBus();
     if (!bus) return;
     const t = ctx.currentTime;
-    // Bright C-major arpeggio: C5, E5, G5
     const notes = [523.25, 659.25, 783.99];
     notes.forEach((freq, i) => {
       const start = t + i * 0.085;
@@ -208,7 +205,6 @@ export default function TriviaGame() {
     const bus = newSfxBus();
     if (!bus) return;
     const t = ctx.currentTime;
-    // Two-note descending "wah-womp"
     const segs = [
       { f: 230, dur: 0.20 },
       { f: 165, dur: 0.32 },
@@ -237,7 +233,6 @@ export default function TriviaGame() {
     const bus = newSfxBus();
     if (!bus) return;
     const t = ctx.currentTime;
-    // Triumphant fanfare: C5 E5 G5 → C6 sustained, with octave doubling
     const notes = [
       { f: 523.25, start: 0,    dur: 0.18 },
       { f: 659.25, start: 0.18, dur: 0.18 },
@@ -307,7 +302,6 @@ export default function TriviaGame() {
     return () => clearInterval(id);
   }, [screen, currentIndex, answered, questionTime]);
 
-  // Tick sound at 5s and below
   useEffect(() => {
     if (screen !== 'question' || answered) {
       lastTickSecRef.current = null;
@@ -331,7 +325,7 @@ export default function TriviaGame() {
   }, []);
 
   const advanceToNext = useCallback(() => {
-    if (currentIndex + 1 >= QUESTIONS.length) {
+    if (currentIndex + 1 >= questions.length) {
       goToResults();
       return;
     }
@@ -344,9 +338,9 @@ export default function TriviaGame() {
       setQuestionPhase('entering');
       enteringResetRef.current = setTimeout(() => setQuestionPhase('idle'), 20);
     }, TRANSITION_MS);
-  }, [currentIndex, goToResults]);
+  }, [currentIndex, questions.length, goToResults]);
 
-  // Detect time-out (timer hit 0 without an answer)
+  // Detect time-out
   useEffect(() => {
     if (screen !== 'question' || answered) return;
     if (timeLeft > 0) return;
@@ -364,22 +358,44 @@ export default function TriviaGame() {
     advanceTimerRef.current = setTimeout(advanceToNext, ADVANCE_DELAY_MS);
   }, [timeLeft, screen, answered, currentQ, flashWrong, playWrong, advanceToNext]);
 
-  // Trigger high-score fanfare when results screen first appears
+  // High-score fanfare on results entry
   useEffect(() => {
     if (screen !== 'results') return;
-    if (score / QUESTIONS.length < HIGH_SCORE_THRESHOLD) return;
+    if (questions.length === 0) return;
+    if (score / questions.length < HIGH_SCORE_THRESHOLD) return;
     highScoreTimerRef.current = setTimeout(() => playHighScore(), 350);
     return () => {
       if (highScoreTimerRef.current) clearTimeout(highScoreTimerRef.current);
       highScoreTimerRef.current = null;
     };
-  }, [screen, score, playHighScore]);
+  }, [screen, score, questions.length, playHighScore]);
+
+  // After fetch resolves on the loading screen, transition forward (or back to start on error).
+  useEffect(() => {
+    if (screen !== 'loading') return;
+    if (screenPhase !== 'idle') return;
+    if (questions.length > 0) {
+      setScreenPhase('leaving');
+      screenSwapTimerRef.current = setTimeout(() => {
+        setScreen('question');
+        setScreenPhase('entering');
+        enteringResetRef.current = setTimeout(() => setScreenPhase('idle'), 20);
+      }, TRANSITION_MS);
+    } else if (loadError) {
+      setScreenPhase('leaving');
+      screenSwapTimerRef.current = setTimeout(() => {
+        setScreen('start');
+        setScreenPhase('entering');
+        enteringResetRef.current = setTimeout(() => setScreenPhase('idle'), 20);
+      }, TRANSITION_MS);
+    }
+  }, [screen, screenPhase, questions.length, loadError]);
 
   const startGame = useCallback(() => {
     clearTimers();
     ensureAudio();
+
     setScore(0);
-    setOrder(shuffle(QUESTIONS.map((_, i) => i)));
     setCurrentIndex(0);
     setAnswered(false);
     setSelected(null);
@@ -388,14 +404,33 @@ export default function TriviaGame() {
     setTimeLeft(DIFFICULTIES[difficulty].seconds);
     setPlayerName('');
     setSavedEntryDate(null);
+    setQuestions([]);
+    setLoadError(null);
     lastTickSecRef.current = null;
 
+    // Transition the visible screen → loading
     setScreenPhase('leaving');
     screenSwapTimerRef.current = setTimeout(() => {
-      setScreen('question');
+      setScreen('loading');
       setScreenPhase('entering');
       enteringResetRef.current = setTimeout(() => setScreenPhase('idle'), 20);
     }, TRANSITION_MS);
+
+    // Kick off the fetch in parallel; the loading→question transition is driven
+    // by the effect above once `questions` populates (or `loadError` is set).
+    const controller = new AbortController();
+    fetchAbortRef.current = controller;
+    fetchQuestions(difficulty, QUESTIONS_PER_GAME, controller.signal)
+      .then((qs) => {
+        if (controller.signal.aborted) return;
+        setQuestions(qs);
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        const msg =
+          err instanceof Error ? err.message : 'Could not load field notes.';
+        setLoadError(msg);
+      });
   }, [clearTimers, ensureAudio, difficulty]);
 
   const goHome = useCallback(() => {
@@ -404,6 +439,7 @@ export default function TriviaGame() {
     setSelected(null);
     setFeedback(null);
     setQuestionPhase('idle');
+    setLoadError(null);
     setScreenPhase('leaving');
     screenSwapTimerRef.current = setTimeout(() => {
       setScreen('start');
@@ -438,12 +474,12 @@ export default function TriviaGame() {
   function handleSaveScore(e: React.FormEvent) {
     e.preventDefault();
     const name = playerName.trim();
-    if (!name) return;
+    if (!name || questions.length === 0) return;
     const date = Date.now();
     const updated = addScore({
       name: name.slice(0, NAME_MAX),
       score,
-      total: QUESTIONS.length,
+      total: questions.length,
       difficulty: activeDifficulty,
       date,
     });
@@ -467,6 +503,7 @@ export default function TriviaGame() {
   const showStatusBar = screen === 'question';
   const urgent = timeLeft <= 5;
   const timerPct = Math.max(0, (timeLeft / questionTime) * 100);
+  const totalQuestions = questions.length;
 
   const screenClass = (s: Screen) =>
     'screen' + (screen === s && screenPhase !== 'idle' ? ' ' + screenPhase : '');
@@ -494,7 +531,7 @@ export default function TriviaGame() {
               <div className="pill">
                 <span className="label">Field Note</span>
                 <span className="value">
-                  {currentIndex + 1} / {QUESTIONS.length}
+                  {currentIndex + 1} / {totalQuestions}
                 </span>
               </div>
               <div className="pill">
@@ -525,9 +562,13 @@ export default function TriviaGame() {
               <div className="hero">🐾</div>
               <h2>Ready to roam the animal kingdom?</h2>
               <p className="lead">
-                10 field notes. 4 choices each. Beat the clock, log your score, and climb the
-                journal of legendary rangers.
+                10 fresh field notes pulled from the wildlife archive. 4 choices each. Beat the
+                clock, log your score, and climb the journal of legendary rangers.
               </p>
+
+              {loadError && (
+                <div className="error-banner" role="alert">{loadError}</div>
+              )}
 
               <div className="difficulty-section">
                 <div className="difficulty-heading">Choose your trail</div>
@@ -561,11 +602,21 @@ export default function TriviaGame() {
             </section>
           )}
 
+          {/* ---------- Loading screen ---------- */}
+          {screen === 'loading' && (
+            <section className={screenClass('loading') + ' loading-screen'}>
+              <div className="hero">🔭</div>
+              <h2>Tracking down field notes…</h2>
+              <div className="spinner" role="status" aria-label="Loading questions" />
+              <p className="lead">Reaching out to the wildlife archive.</p>
+            </section>
+          )}
+
           {/* ---------- Question screen ---------- */}
           {screen === 'question' && currentQ && (
             <section className={questionScreenClass}>
               <div className="q-meta">
-                <span>Field Note {currentIndex + 1} of {QUESTIONS.length}</span>
+                <span>Field Note {currentIndex + 1} of {totalQuestions}</span>
               </div>
               <div className="q-text">{currentQ.q}</div>
               <div className="options">
@@ -610,7 +661,7 @@ export default function TriviaGame() {
 
           {/* ---------- Results screen ---------- */}
           {screen === 'results' && (() => {
-            const copy = resultCopy(score, QUESTIONS.length);
+            const copy = resultCopy(score, totalQuestions);
             const trailRun = DIFFICULTIES[activeDifficulty];
             return (
               <section className={screenClass('results') + ' results'}>
@@ -620,7 +671,7 @@ export default function TriviaGame() {
                   Trail: {trailRun.trail} {trailRun.badge}
                 </div>
                 <div className="big-score">
-                  {score} / {QUESTIONS.length}
+                  {score} / {totalQuestions}
                 </div>
                 <p className="blurb">{copy.blurb}</p>
 
